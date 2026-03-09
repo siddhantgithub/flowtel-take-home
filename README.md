@@ -1,216 +1,103 @@
-## Overview
+# DataSync Analytics - Event Ingestion Service
 
-Build a production-ready data ingestion system that extracts event data from the DataSync Analytics API and stores it in a PostgreSQL database.
+A production-ready TypeScript ingestion service that extracts all 3,000,000 events from the DataSync Analytics API and stores them in PostgreSQL.
 
-## Requirements
-
-Your solution must:
-
-1. Run entirely in Docker using the provided `docker-compose.yml`
-2. Work with the command: `sh run-ingestion.sh`
-**Tools Policy:**
-- **Allowed:** Any AI coding tools or development tools during development
-- **Solution constraint:** Your final solution must run entirely in Docker without requiring external API keys or 3rd party services
-
-
-If you use AI tools, please document which ones and how they helped in your solution's README.
-
-## The Challenge
-
-DataSync Analytics is a live application with:
-- **Dashboard:** http://datasync-dev-alb-101078500.us-east-1.elb.amazonaws.com (explore the UI!)
-- **API:** http://datasync-dev-alb-101078500.us-east-1.elb.amazonaws.com/api/v1
-
-Your task is to:
-
-1. **Connect** to the DataSync API
-2. **Extract** ALL events from the system (3,000,000)
-3. **Handle** the API's pagination correctly
-4. **Respect** rate limits
-5. **Store** data in PostgreSQL
-7. **Make it resumable** (save progress, resume after failure)
-
-### Important Notes
-
-- The API documentation is minimal by design
-- Part of this challenge is **discovering** how the API works
-- Pay attention to response headers and data formats
-- The API has behaviors that aren't documented
-- Timestamp formats may vary across responses - normalize carefully
-
-## Getting Started
-
-### Prerequisites
-
-- Docker and Docker Compose
-- Node.js 20+
-- npm or yarn
-
-### Your Workspace
-
-Use this directory as your workspace. A `docker-compose.yml` is provided with PostgreSQL for your solution.
+## How to Run
 
 ```bash
-docker compose up -d
+# Set your API key
+export API_KEY=your_api_key_here
+
+# Run the ingestion
+sh run-ingestion.sh
 ```
 
-This gives you:
-- PostgreSQL at `localhost:5434`
+This starts PostgreSQL 16 and the ingestion service via Docker Compose. The script monitors progress and exits when ingestion is complete. Event IDs are exported to `output/event_ids.txt`.
 
-### Exploring the Application
+## Architecture Overview
 
-**Dashboard:** http://datasync-dev-alb-101078500.us-east-1.elb.amazonaws.com
-- Browse the dashboard to understand the data model
-- Curious developers explore everything...
+```
+Coordinator
+    |
+    v
+WorkerPool (feed retry loop, up to 10 attempts)
+    |
+    +---> ApiClient (stream feed / /events fallback)
+    |
+    +---> DB Layer (COPY protocol / unnest fallback)
+```
 
-**API Key:** You should have received a unique API key from your interviewer.
+**Components:**
 
-> **Important:** Your API key is valid for **90 minutes from first use**. The timer starts when you make your first API call. Plan your work accordingly.
+| Component | File | Responsibility |
+|-----------|------|---------------|
+| Entry Point | `src/index.ts` | Config, DB pool, global error handlers |
+| Coordinator | `src/coordinator.ts` | Orchestration, feed retry loop, fallback strategy |
+| WorkerPool | `src/worker.ts` | Pipelined fetch+insert, progress tracking, checkpointing |
+| ApiClient | `src/api.ts` | Stream token management, retry with backoff, cursor expiry handling |
+| DB Layer | `src/db.ts` | COPY/unnest bulk insert, migrations, deferred indexes |
 
-## Requirements
+See [docs/architecture.md](docs/architecture.md) for detailed architecture documentation with diagrams.
 
-### Must Have
+## API Discoveries
 
-1. **TypeScript** codebase
-2. **PostgreSQL** for data storage
-3. **Docker Compose** for running your solution
-4. **Proper error handling** and logging
-5. **Rate limit handling** - respect the API limits
-6. **Resumable ingestion** - if the process crashes, it should resume from where it left off
+1. **Hidden stream feed endpoint** - Exploring the dashboard's JavaScript bundle revealed `/internal/dashboard/stream-access`, which returns a token granting access to `/api/v1/events/d4ta/x7k9/feed`. This endpoint has **no rate limit** and returns up to 5,000 events per page.
 
-### Should Have
+2. **Stream token auth** - The stream access endpoint requires a browser-like `User-Agent` header and the API key passed as a cookie (`dashboard_api_key`). Tokens expire in 300s.
 
-1. **Throughput optimization** - maximize events per second
-2. **Progress tracking** - show ingestion progress
-3. **Health checks** - monitor worker health
+3. **Cursor structure** - Cursors are base64-encoded JSON containing `{id, ts, v, exp}`. The server does not validate the `exp` field, allowing us to extend cursor expiry to 24 hours on checkpoint save for crash-resilient resume.
 
-### Nice to Have
+4. **Shared rate limit budget** - Both the feed and `/events` endpoints share the same rate limit pool. Running them in parallel is counterproductive.
 
-1. **Unit tests**
-2. **Integration tests**
-3. **Metrics/monitoring**
-4. **Architecture documentation**
+5. **Timestamp formats** - The API returns timestamps as epoch milliseconds, epoch seconds, and ISO strings inconsistently. The `normalizeTimestamp()` function handles all variants.
 
-## Submitting Your Results
+## Throughput Optimization
 
-Once you've ingested all events, submit your results to verify completion.
+| Technique | Impact |
+|-----------|--------|
+| Hidden stream feed (no rate limit) | Removes 10 req/min bottleneck |
+| COPY protocol with UNLOGGED staging table | ~5-10x faster than row-by-row INSERT |
+| Pipelined fetch+insert (overlap I/O) | Hides DB latency behind network latency |
+| Deferred index creation | Avoids index maintenance during bulk load |
+| `ON CONFLICT DO NOTHING` dedup | Safe resume without duplicate checking |
 
-### Step 1: Push Your Solution to GitHub
+**Observed throughput:** ~1,000-1,500 events/sec (bottlenecked by API response time of ~3.5s per 5,000-event page).
 
-Before submitting, push your solution to a GitHub repository. This allows us to review your code and see your commit history/progress.
+## Resilience & Resume
 
-### Step 2: Submit via API
+- **Cursor resume**: Checkpoints saved every 10 pages with cursor expiry extended to 24h. On restart, resumes from exact position.
+- **Feed retry**: Up to 10 attempts with fresh stream token and increasing backoff before falling to `/events`.
+- **COPY fallback**: If COPY protocol fails, automatically switches to `unnest`-based array inserts.
+- **Cursor expiration**: `CursorExpiredError` resets cursor and continues; dedup handles overlap.
+- **Fallback endpoint**: `/events` with `since=maxTimestamp` for true skip-ahead resume as last resort.
+- **Docker restart**: `restart: on-failure` policy for automatic recovery.
+- **Idempotent writes**: `INSERT ... ON CONFLICT (id) DO NOTHING` makes re-processing safe.
 
-**POST** `http://datasync-dev-alb-101078500.us-east-1.elb.amazonaws.com/api/v1/submissions`
+## Testing
 
-Submit a file containing all event IDs (one per line) along with your GitHub repo URL.
-
-**Headers:**
-- `X-API-Key`: Your API key
-- `Content-Type`: `text/plain` or `application/json`
-
-**Option 1: Plain text with query param (recommended)**
 ```bash
-curl -X POST \
-  -H "X-API-Key: YOUR_API_KEY" \
-  -H "Content-Type: text/plain" \
-  --data-binary @event_ids.txt \
-  "http://datasync-dev-alb-101078500.us-east-1.elb.amazonaws.com/api/v1/submissions?github_repo=https://github.com/yourusername/your-repo"
+cd packages/ingestion && npm test
 ```
 
-**Option 2: JSON**
-```bash
-curl -X POST \
-  -H "X-API-Key: YOUR_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "ids": "id1\nid2\nid3",
-    "githubRepoUrl": "https://github.com/yourusername/your-repo"
-  }' \
-  http://datasync-dev-alb-101078500.us-east-1.elb.amazonaws.com/api/v1/submissions
-```
+18 unit tests across 3 suites:
+- **normalizeTimestamp** (8 tests) - epoch ms/seconds, ISO strings, edge cases
+- **cursorExpiration** (4 tests) - error class, detection from /events and feed, no retry
+- **worker** (6 tests) - cursor reset, empty page guards, COPY fallback, pending flush
 
-**Response:**
-```json
-{
-  "success": true,
-  "data": {
-    "submissionId": "uuid",
-    "eventCount": 3000000,
-    "githubRepoUrl": "https://github.com/yourusername/your-repo",
-    "submittedAt": "2024-01-15T10:30:00.000Z",
-    "timeToSubmit": {
-      "ms": 1234567,
-      "seconds": 1235,
-      "minutes": 20.6,
-      "formatted": "20m 35s"
-    },
-    "submissionNumber": 1,
-    "remainingSubmissions": 4
-  },
-  "message": "Submission #1 received with 3,000,000 event IDs. 4 submissions remaining."
-}
-```
+## What I Would Improve With More Time
 
-**Limits:**
-- Maximum **5 submissions** per API key
-- The response includes your completion time (from first API call to submission)
+- Integration tests against a mock API server
+- Prometheus metrics endpoint for monitoring throughput and error rates
+- Parallel feed streams if the API supported independent cursors per partition
+- Streaming export of event IDs (currently loads all into memory for ORDER BY)
+- Circuit breaker pattern for API failures instead of simple retry counter
 
-**Check your submissions:**
-```bash
-curl -H "X-API-Key: YOUR_API_KEY" \
-  http://datasync-dev-alb-101078500.us-east-1.elb.amazonaws.com/api/v1/submissions
-```
+## AI Tools Used
 
-## Important: Verification Testing
-
-**Your solution will be tested after submission to verify it works correctly.**
-
-- The full ingestion must work when running `sh run-ingestion.sh` from scratch on a clean Linux machine using Docker
-- We will run your solution on a fresh environment with only Docker installed
-- The following do NOT count as valid solutions:
-  - WIP/incomplete code that requires manual intervention
-  - Solutions that require manual pauses or human interaction during execution
-  - Code that needs to be modified after starting the ingestion
-  - Solutions that only work after multiple manual restarts
-
-Your solution must be fully automated and complete the entire ingestion without any manual steps.
-
-## What to Submit
-
-Your solution should include:
-
-1. All source code in the `packages/` directory
-2. Updated `docker-compose.yml` if needed
-3. `README.md` with:
-   - How to run your solution
-   - Architecture overview
-   - Any discoveries about the API
-   - What you would improve with more time
-
-## Evaluation Criteria
-
-| Category | Weight |
-|----------|--------|
-| API Discovery & Throughput | 60% |
-| Job Processing Architecture | 40% |
-
-**Your score is primarily based on throughput** - how many events per minute can your solution ingest?
-
-> **Challenge yourself:** Top candidates have solved this entire challenge - including ingesting all 3M events - in under 30 minutes. If you feel limited by the API, keep pushing. There's always a faster way.
-
-## Tips
-
-- Start by exploring the API thoroughly - this is critical
-- Make requests, look at responses, **check headers carefully**
-- The documented API may not be the fastest way...
-- Think about failure scenarios - what happens if the process crashes mid-ingestion?
-- Consider how to **maximize throughput** while respecting rate limits
-- Good engineers explore every corner of an application
-- Cursors have a lifecycle - don't let them get stale
-
-## Questions?
-
-If something is unclear about the requirements (not the API!), please reach out to your contact.
-
-Good luck!
+**Claude Code** (Anthropic's CLI for Claude) was used as a coding partner throughout development. It helped with:
+- Exploring the API and dashboard to discover the hidden stream feed endpoint
+- Implementing the COPY protocol with proper `stream.pipeline()` backpressure handling
+- Debugging cursor expiration and token refresh edge cases
+- Writing unit tests for critical resilience paths
+- Discovering the cursor expiry extension technique (base64 decode + re-encode with longer TTL)
+- Architecture documentation

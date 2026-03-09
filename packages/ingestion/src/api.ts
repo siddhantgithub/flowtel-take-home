@@ -57,25 +57,28 @@ export class ApiClient {
     }
 
     console.log("Obtaining stream access token...");
-    const res = await fetch(`${this.baseUrl}/internal/dashboard/stream-access`, {
-      method: "POST",
-      headers: {
-        "X-API-Key": this.apiKey,
-        "Content-Type": "application/json",
-        "Cookie": `dashboard_api_key=${this.apiKey}`,
-        "User-Agent": BROWSER_UA,
-        "Referer": `${this.baseUrl}/`,
-        "Origin": this.baseUrl,
-      },
-    });
+    let lastErr: Error | null = null;
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        const res = await fetch(`${this.baseUrl}/internal/dashboard/stream-access`, {
+          method: "POST",
+          headers: {
+            "X-API-Key": this.apiKey,
+            "Content-Type": "application/json",
+            "Cookie": `dashboard_api_key=${this.apiKey}`,
+            "User-Agent": BROWSER_UA,
+            "Referer": `${this.baseUrl}/`,
+            "Origin": this.baseUrl,
+          },
+        });
 
-    if (!res.ok) {
-      const body = await res.text();
-      throw new Error(`Failed to get stream access: ${res.status} ${body}`);
-    }
+        if (!res.ok) {
+          const body = await res.text();
+          throw new Error(`Failed to get stream access: ${res.status} ${body}`);
+        }
 
-    const data = await res.json() as any;
-    const sa = data.streamAccess;
+        const data = await res.json() as any;
+        const sa = data.streamAccess;
 
     this.streamAccess = {
       endpoint: sa.endpoint,
@@ -84,8 +87,18 @@ export class ApiClient {
       obtainedAt: Date.now(),
     };
 
-    console.log(`Stream token obtained. Endpoint: ${sa.endpoint}, expires in ${sa.expiresIn}s`);
-    return this.streamAccess;
+        console.log(`Stream token obtained. Endpoint: ${sa.endpoint}, expires in ${sa.expiresIn}s`);
+        return this.streamAccess;
+      } catch (err: any) {
+        lastErr = err;
+        if (attempt < 3) {
+          const backoff = 1000 * Math.pow(2, attempt - 1);
+          console.log(`[StreamAccess attempt ${attempt}/3] ${err.message}. Retrying in ${backoff}ms...`);
+          await sleep(backoff);
+        }
+      }
+    }
+    throw lastErr ?? new Error("Failed to get stream access after retries");
   }
 
   // Fetch from the stream/feed endpoint (no rate limit!)
@@ -161,15 +174,15 @@ export class ApiClient {
         return { response, rateLimit };
       } catch (error: any) {
         lastError = error;
-        if (attempt < MAX_RETRIES) {
+        if (attempt < maxAttempts) {
           const backoff = Math.min(1000 * Math.pow(2, attempt - 1), 10000);
-          console.log(`[Feed attempt ${attempt}/${MAX_RETRIES}] ${error.message}. Retrying in ${backoff}ms...`);
+          console.log(`[Feed attempt ${attempt}/${maxAttempts}] ${error.message}. Retrying in ${backoff}ms...`);
           await sleep(backoff);
         }
       }
     }
 
-    throw lastError;
+    throw lastError ?? new Error("Feed failed after max retries");
   }
 
   // Fetch events page from /api/v1/events (rate-limited fallback)

@@ -5,7 +5,6 @@ import { IngestionStats, RawEvent } from "./types";
 import { Config } from "./config";
 
 const TARGET = 3_000_000;
-const COPY_TIMEOUT_MS = 15_000;
 
 export class WorkerPool {
   private client: ApiClient;
@@ -34,27 +33,21 @@ export class WorkerPool {
       return bulkInsertEventsUnnest(this.pool, events);
     }
     try {
-      return await Promise.race([
-        bulkInsertEvents(this.pool, events),
-        new Promise<never>((_, reject) =>
-          setTimeout(() => reject(new Error("COPY timeout")), COPY_TIMEOUT_MS)
-        ),
-      ]);
+      return await bulkInsertEvents(this.pool, events);
     } catch (err: any) {
-      if (err.message === "COPY timeout") {
-        console.warn("COPY timed out — switching to unnest INSERT");
-        this.useCopy = false;
-        return bulkInsertEventsUnnest(this.pool, events);
-      }
-      throw err;
+      // If COPY fails for any reason, switch to unnest for the rest of the run
+      console.warn(`COPY failed (${err.message}) — switching to unnest INSERT`);
+      this.useCopy = false;
+      return bulkInsertEventsUnnest(this.pool, events);
     }
   }
 
   // Primary: single feed stream (no rate limit, ~5000/page, ~3.5s/page)
-  async runFeed(): Promise<number> {
-    let cursor: string | undefined;
+  async runFeed(initialCursor?: string | null): Promise<number> {
+    let cursor: string | undefined = initialCursor ?? undefined;
     let pages = 0;
     let pendingInsert: Promise<number> | null = null;
+    let consecutiveEmpty = 0;
 
     // Monitor progress in background
     const monitor = setInterval(async () => {
@@ -69,20 +62,31 @@ export class WorkerPool {
         const { response } = await this.client.fetchFeed(cursor, this.config.batchSize);
         pages++;
 
+        // Flush previous insert
         if (pendingInsert) await pendingInsert;
 
         if (response.data.length > 0) {
+          consecutiveEmpty = 0;
           pendingInsert = this.insertEvents(response.data);
         } else {
+          consecutiveEmpty++;
           pendingInsert = null;
+          if (consecutiveEmpty >= 10) {
+            console.warn("[Feed] 10 consecutive empty pages — stopping.");
+            break;
+          }
         }
 
-        if (pages % 50 === 0) {
-          console.log(`[Feed] ${pages} pages fetched`);
+        // Save checkpoint every 20 pages
+        if (pages % 20 === 0) {
+          if (pendingInsert) { await pendingInsert; pendingInsert = null; }
+          this.stats.totalSaved = await getEventCount(this.pool);
+          await saveCheckpoint(this.pool, response.pagination.nextCursor ?? null, this.stats.totalSaved);
+          console.log(`[Feed] ${pages} pages, checkpoint saved at ${this.stats.totalSaved}`);
         }
 
         if (!response.pagination.hasMore || !response.pagination.nextCursor) {
-          if (pendingInsert) await pendingInsert;
+          if (pendingInsert) { await pendingInsert; pendingInsert = null; }
           console.log(`[Feed] Done after ${pages} pages.`);
           break;
         }
@@ -90,6 +94,12 @@ export class WorkerPool {
         cursor = response.pagination.nextCursor;
       }
     } finally {
+      // Always flush pending insert before exiting
+      if (pendingInsert) {
+        try { await pendingInsert; } catch (e: any) {
+          console.error(`[Feed] Error flushing pending insert: ${e.message}`);
+        }
+      }
       clearInterval(monitor);
     }
 
@@ -103,6 +113,7 @@ export class WorkerPool {
     let cursor = initialCursor ?? undefined;
     let pendingInsert: Promise<number> | null = null;
     let pages = 0;
+    let consecutiveEmpty = 0;
 
     while (this.stats.totalSaved < TARGET) {
       const { response } = await this.client.fetchEvents(cursor, this.config.batchSize);
@@ -111,11 +122,18 @@ export class WorkerPool {
       if (pendingInsert) await pendingInsert;
 
       if (response.data.length > 0) {
+        consecutiveEmpty = 0;
         pendingInsert = this.insertEvents(response.data);
       } else {
+        consecutiveEmpty++;
         pendingInsert = null;
+        if (consecutiveEmpty >= 10) {
+          console.warn("[Events] 10 consecutive empty pages — stopping.");
+          break;
+        }
       }
 
+      // Checkpoint every 5 pages
       if (pages % 5 === 0) {
         if (pendingInsert) { await pendingInsert; pendingInsert = null; }
         this.stats.totalSaved = await getEventCount(this.pool);
@@ -125,13 +143,20 @@ export class WorkerPool {
       this.logProgress();
 
       if (!response.pagination.hasMore || !response.pagination.nextCursor) {
-        if (pendingInsert) await pendingInsert;
+        if (pendingInsert) { await pendingInsert; pendingInsert = null; }
         this.stats.totalSaved = await getEventCount(this.pool);
         console.log("No more events from API.");
         break;
       }
 
       cursor = response.pagination.nextCursor;
+    }
+
+    // Flush any remaining pending insert
+    if (pendingInsert) {
+      try { await pendingInsert; } catch (e: any) {
+        console.error(`[Events] Error flushing pending insert: ${e.message}`);
+      }
     }
 
     await saveCheckpoint(this.pool, null, this.stats.totalSaved);

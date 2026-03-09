@@ -18,6 +18,13 @@ export async function runIngestion(client: ApiClient, pool: Pool, config: Config
     return;
   }
 
+  // Load checkpoint for resume
+  const checkpoint = await loadCheckpoint(pool);
+  const resumeCursor = checkpoint?.cursor ?? null;
+  if (checkpoint) {
+    console.log(`Loaded checkpoint: cursor=${resumeCursor ? resumeCursor.substring(0, 20) + "..." : "null"}, saved=${checkpoint.eventsSaved}, at=${checkpoint.updatedAt.toISOString()}`);
+  }
+
   console.log(`Existing events: ${existingCount}. Need ${TARGET_EVENTS - existingCount} more.`);
   config.batchSize = FEED_PAGE_SIZE;
 
@@ -27,7 +34,7 @@ export async function runIngestion(client: ApiClient, pool: Pool, config: Config
   try {
     console.log("Strategy: STREAM FEED (no rate limit, 5000/page)");
     await client.getStreamAccess();
-    await workerPool.runFeed();
+    await workerPool.runFeed(resumeCursor);
   } catch (error: any) {
     console.error(`Stream feed failed: ${error?.message ?? error}`);
     console.log("Falling back to standard /events endpoint...");
@@ -35,11 +42,12 @@ export async function runIngestion(client: ApiClient, pool: Pool, config: Config
     const currentCount = await getEventCount(pool);
     if (currentCount < TARGET_EVENTS) {
       const fallbackWorker = new WorkerPool(client, pool, config, currentCount);
+      // Note: feed cursors and /events cursors are different spaces, start fresh
       await fallbackWorker.runPipelined(null);
     }
   }
 
-  // Verify count
+  // Verify count — run fallback if still short
   const countAfterMain = await getEventCount(pool);
   if (countAfterMain < TARGET_EVENTS) {
     console.log(`After primary: ${countAfterMain}. Running fallback...`);

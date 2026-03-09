@@ -184,6 +184,14 @@ export async function getEventCount(pool: Pool): Promise<number> {
   return result.rows[0].count;
 }
 
+export async function getMaxTimestampMs(pool: Pool): Promise<number | null> {
+  const result = await pool.query(`SELECT extract(epoch from max(timestamp))::bigint * 1000 AS max_ts FROM ingested_events`);
+  const val = result.rows[0]?.max_ts;
+  if (val === null || val === undefined) return null;
+  const num = typeof val === "string" ? parseInt(val, 10) : val;
+  return isNaN(num) ? null : num;
+}
+
 export async function exportEventIds(pool: Pool, filePath: string): Promise<number> {
   const client = await pool.connect();
   try {

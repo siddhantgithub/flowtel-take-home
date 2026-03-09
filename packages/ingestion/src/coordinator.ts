@@ -1,7 +1,7 @@
 import { Pool } from "pg";
 import { ApiClient } from "./api";
 import { Config } from "./config";
-import { loadCheckpoint, getEventCount, exportEventIds, createIndexes } from "./db";
+import { loadCheckpoint, getEventCount, getMaxTimestampMs, exportEventIds, createIndexes } from "./db";
 import { WorkerPool } from "./worker";
 
 const TARGET_EVENTS = 3_000_000;
@@ -18,11 +18,10 @@ export async function runIngestion(client: ApiClient, pool: Pool, config: Config
     return;
   }
 
-  // Load checkpoint for resume
-  const checkpoint = await loadCheckpoint(pool);
-  const resumeCursor = checkpoint?.cursor ?? null;
-  if (checkpoint) {
-    console.log(`Loaded checkpoint: cursor=${resumeCursor ? resumeCursor.substring(0, 20) + "..." : "null"}, saved=${checkpoint.eventsSaved}, at=${checkpoint.updatedAt.toISOString()}`);
+  // Get max timestamp for resume — skip already-ingested time range
+  const maxTs = await getMaxTimestampMs(pool);
+  if (maxTs && maxTs > 0) {
+    console.log(`Resume: max timestamp in DB = ${new Date(maxTs).toISOString()} (${maxTs})`);
   }
 
   console.log(`Existing events: ${existingCount}. Need ${TARGET_EVENTS - existingCount} more.`);
@@ -34,16 +33,17 @@ export async function runIngestion(client: ApiClient, pool: Pool, config: Config
   try {
     console.log("Strategy: STREAM FEED (no rate limit, 5000/page)");
     await client.getStreamAccess();
-    await workerPool.runFeed(resumeCursor);
+    // Feed data isn't chronological — don't use since, rely on dedup
+    await workerPool.runFeed(null);
   } catch (error: any) {
     console.error(`Stream feed failed: ${error?.message ?? error}`);
     console.log("Falling back to standard /events endpoint...");
 
     const currentCount = await getEventCount(pool);
     if (currentCount < TARGET_EVENTS) {
+      const currentMaxTs = await getMaxTimestampMs(pool);
       const fallbackWorker = new WorkerPool(client, pool, config, currentCount);
-      // Note: feed cursors and /events cursors are different spaces, start fresh
-      await fallbackWorker.runPipelined(null);
+      await fallbackWorker.runPipelined(null, currentMaxTs);
     }
   }
 
@@ -51,8 +51,9 @@ export async function runIngestion(client: ApiClient, pool: Pool, config: Config
   const countAfterMain = await getEventCount(pool);
   if (countAfterMain < TARGET_EVENTS) {
     console.log(`After primary: ${countAfterMain}. Running fallback...`);
+    const currentMaxTs = await getMaxTimestampMs(pool);
     const fallbackWorker = new WorkerPool(client, pool, config, countAfterMain);
-    await fallbackWorker.runPipelined(null);
+    await fallbackWorker.runPipelined(null, currentMaxTs);
   }
 
   // Post-ingestion

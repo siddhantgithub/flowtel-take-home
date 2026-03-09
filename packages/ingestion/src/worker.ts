@@ -1,5 +1,5 @@
 import { Pool } from "pg";
-import { ApiClient } from "./api";
+import { ApiClient, CursorExpiredError } from "./api";
 import { bulkInsertEvents, bulkInsertEventsUnnest, saveCheckpoint, getEventCount } from "./db";
 import { IngestionStats, RawEvent } from "./types";
 import { Config } from "./config";
@@ -43,11 +43,16 @@ export class WorkerPool {
   }
 
   // Primary: single feed stream (no rate limit, ~5000/page, ~3.5s/page)
-  async runFeed(initialCursor?: string | null): Promise<number> {
+  async runFeed(initialCursor?: string | null, sinceMs?: number | null): Promise<number> {
     let cursor: string | undefined = initialCursor ?? undefined;
     let pages = 0;
     let pendingInsert: Promise<number> | null = null;
     let consecutiveEmpty = 0;
+    let useSince = sinceMs ?? undefined; // only used on first request (no cursor)
+
+    if (useSince) {
+      console.log(`[Feed] Resuming with since=${new Date(useSince).toISOString()}`);
+    }
 
     // Monitor progress in background
     const monitor = setInterval(async () => {
@@ -59,7 +64,24 @@ export class WorkerPool {
 
     try {
       while (this.stats.totalSaved < TARGET) {
-        const { response } = await this.client.fetchFeed(cursor, this.config.batchSize);
+        let response;
+        try {
+          ({ response } = await this.client.fetchFeed(
+            cursor, this.config.batchSize,
+            cursor ? undefined : useSince,  // since only on first request
+            undefined
+          ));
+        } catch (err: any) {
+          if (err instanceof CursorExpiredError) {
+            console.warn(`[Feed] Cursor expired — resetting. Progress preserved via dedup.`);
+            cursor = undefined;
+            // Keep useSince so we don't re-fetch from the very beginning
+            continue;
+          }
+          throw err;
+        }
+        // Clear useSince after first successful fetch — cursor takes over
+        useSince = undefined;
         pages++;
 
         // Flush previous insert
@@ -109,14 +131,32 @@ export class WorkerPool {
   }
 
   // Fallback: /events endpoint (rate-limited 10 req/min)
-  async runPipelined(initialCursor?: string | null): Promise<number> {
+  async runPipelined(initialCursor?: string | null, sinceMs?: number | null): Promise<number> {
     let cursor = initialCursor ?? undefined;
     let pendingInsert: Promise<number> | null = null;
     let pages = 0;
     let consecutiveEmpty = 0;
+    let useSince = sinceMs ?? undefined;
+
+    if (useSince) {
+      console.log(`[Events] Resuming with since=${new Date(useSince).toISOString()}`);
+    }
 
     while (this.stats.totalSaved < TARGET) {
-      const { response } = await this.client.fetchEvents(cursor, this.config.batchSize);
+      let response;
+      const extraParams: Record<string, string> | undefined =
+        !cursor && useSince ? { since: String(useSince) } : undefined;
+      try {
+        ({ response } = await this.client.fetchEvents(cursor, this.config.batchSize, extraParams));
+      } catch (err: any) {
+        if (err instanceof CursorExpiredError) {
+          console.warn(`[Events] Cursor expired — resetting. Progress preserved via dedup.`);
+          cursor = undefined;
+          continue;
+        }
+        throw err;
+      }
+      useSince = undefined;
       pages++;
 
       if (pendingInsert) await pendingInsert;

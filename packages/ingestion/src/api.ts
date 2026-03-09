@@ -19,6 +19,13 @@ export class RateLimitError extends Error {
   }
 }
 
+export class CursorExpiredError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "CursorExpiredError";
+  }
+}
+
 const NON_RETRYABLE_STATUSES = [401, 403];
 const MAX_RETRIES = 5;
 const BROWSER_UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36";
@@ -148,6 +155,14 @@ export class ApiClient {
           continue;
         }
 
+        if (res.status === 400) {
+          const body = await res.text();
+          if (body.includes("CURSOR_EXPIRED") || body.includes("Cursor expired")) {
+            throw new CursorExpiredError(body);
+          }
+          throw new Error(`Feed error ${res.status}: ${body}`);
+        }
+
         if (!res.ok) {
           const body = await res.text();
           throw new Error(`Feed error ${res.status}: ${body}`);
@@ -174,6 +189,8 @@ export class ApiClient {
         return { response, rateLimit };
       } catch (error: any) {
         lastError = error;
+        // Don't retry cursor expiration — caller must reset cursor
+        if (error instanceof CursorExpiredError) throw error;
         if (attempt < maxAttempts) {
           const backoff = Math.min(1000 * Math.pow(2, attempt - 1), 10000);
           console.log(`[Feed attempt ${attempt}/${maxAttempts}] ${error.message}. Retrying in ${backoff}ms...`);
@@ -186,8 +203,8 @@ export class ApiClient {
   }
 
   // Fetch events page from /api/v1/events (rate-limited fallback)
-  async fetchEvents(cursor?: string | null, limit?: number): Promise<{ response: ApiResponse; rateLimit: RateLimitInfo }> {
-    return this.fetchWithRetry("/api/v1/events", cursor, limit);
+  async fetchEvents(cursor?: string | null, limit?: number, extraParams?: Record<string, string>): Promise<{ response: ApiResponse; rateLimit: RateLimitInfo }> {
+    return this.fetchWithRetry("/api/v1/events", cursor, limit, extraParams);
   }
 
   // Space requests evenly within the rate limit window
@@ -212,6 +229,7 @@ export class ApiClient {
         return await this._fetch(path, cursor, limit, extraParams);
       } catch (error: any) {
         lastError = error;
+        if (error instanceof CursorExpiredError) throw error;
         if (error instanceof RateLimitError) {
           console.log(`[Attempt ${attempt}/${MAX_RETRIES}] Rate limited on ${path}, waiting ${error.retryAfter}s...`);
           await sleep(error.retryAfter * 1000);
@@ -251,6 +269,14 @@ export class ApiClient {
     }
 
     const rateLimit = this.parseRateLimitHeaders(res.headers);
+
+    if (res.status === 400) {
+      const body = await res.text();
+      if (body.includes("CURSOR_EXPIRED") || body.includes("Cursor expired")) {
+        throw new CursorExpiredError(body);
+      }
+      throw new Error(`API error 400 on ${path}: ${body}`);
+    }
 
     if (res.status === 429) {
       const retryAfter = parseIntHeader(res.headers, "retry-after") ?? Math.ceil((rateLimit.reset ?? 60));

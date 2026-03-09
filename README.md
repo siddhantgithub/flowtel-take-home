@@ -4,15 +4,19 @@ A production-ready TypeScript ingestion service that extracts all 3,000,000 even
 
 ## How to Run
 
+**Option 1: Environment variable**
 ```bash
-# Set your API key
 export API_KEY=your_api_key_here
-
-# Run the ingestion
 sh run-ingestion.sh
 ```
 
-This starts PostgreSQL 16 and the ingestion service via Docker Compose. The script monitors progress and exits when ingestion is complete. Event IDs are exported to `output/event_ids.txt`.
+**Option 2: .env file**
+```bash
+echo "API_KEY=your_api_key_here" > .env
+sh run-ingestion.sh
+```
+
+The script loads `.env` automatically if present, validates the API key, starts PostgreSQL 16 and the ingestion service via Docker Compose, monitors progress, and exits when ingestion is complete. Event IDs are exported to `output/event_ids.txt`.
 
 ## Architecture Overview
 

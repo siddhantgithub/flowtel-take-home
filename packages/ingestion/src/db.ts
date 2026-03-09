@@ -157,12 +157,25 @@ export async function bulkInsertEventsUnnest(pool: Pool, events: RawEvent[]): Pr
   return result.rowCount ?? 0;
 }
 
+// Cursor is base64 JSON with an `exp` field the server doesn't validate.
+// Extend expiry to 24h so saved cursors survive restarts.
+function extendCursorExpiry(cursor: string): string {
+  try {
+    const decoded = JSON.parse(Buffer.from(cursor, "base64").toString("utf-8"));
+    decoded.exp = Date.now() + 24 * 60 * 60 * 1000; // 24 hours from now
+    return Buffer.from(JSON.stringify(decoded)).toString("base64");
+  } catch {
+    return cursor; // if decoding fails, save as-is
+  }
+}
+
 export async function saveCheckpoint(pool: Pool, cursor: string | null, eventsSaved: number): Promise<void> {
+  const safeCursor = cursor ? extendCursorExpiry(cursor) : null;
   await pool.query(
     `INSERT INTO ingestion_checkpoints (id, cursor, events_saved, updated_at)
      VALUES (1, $1, $2, NOW())
      ON CONFLICT (id) DO UPDATE SET cursor = $1, events_saved = $2, updated_at = NOW()`,
-    [cursor, eventsSaved]
+    [safeCursor, eventsSaved]
   );
 }
 

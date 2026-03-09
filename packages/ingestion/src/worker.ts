@@ -99,8 +99,8 @@ export class WorkerPool {
           }
         }
 
-        // Save checkpoint every 20 pages
-        if (pages % 20 === 0) {
+        // Save checkpoint every 10 pages (~35s) — cursor expires in ~120s, so keep it fresh
+        if (pages % 10 === 0) {
           if (pendingInsert) { await pendingInsert; pendingInsert = null; }
           this.stats.totalSaved = await getEventCount(this.pool);
           await saveCheckpoint(this.pool, response.pagination.nextCursor ?? null, this.stats.totalSaved);

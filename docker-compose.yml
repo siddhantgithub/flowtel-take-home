@@ -1,0 +1,49 @@
+# This is your workspace for the assignment.
+# PostgreSQL is provided for your solution.
+# Add your services as needed.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: assignment-postgres
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: ingestion
+    ports:
+      - "5434:5432"
+    volumes:
+      - assignment_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - assignment-network
+
+  ingestion:
+    build: ./packages/ingestion
+    container_name: assignment-ingestion
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/ingestion
+      API_BASE_URL: http://datasync-dev-alb-101078500.us-east-1.elb.amazonaws.com
+      API_KEY: ${API_KEY:-}
+      TARGET_API_KEY: ${TARGET_API_KEY:-}
+      CONCURRENCY: ${CONCURRENCY:-10}
+      BATCH_SIZE: ${BATCH_SIZE:-1000}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - assignment-network
+    restart: on-failure
+    volumes:
+      - ./output:/app/output
+
+volumes:
+  assignment_postgres_data:
+
+networks:
+  assignment-network:
+    driver: bridge
